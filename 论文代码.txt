@@ -1,0 +1,1703 @@
+import os
+try:
+    import ujson as json
+except ImportError:
+    import json
+import random
+import numpy as np
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AdamW, BertTokenizer,BertModel
+import torch
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import LabelEncoder
+from torch.amp import GradScaler, autocast
+import thulac
+from torch import nn
+from transformers import AutoModel, BertConfig
+import warnings
+import functools
+import concurrent.futures
+import re
+import faiss
+import time
+from sklearn.metrics import accuracy_score, f1_score
+import xml.etree.ElementTree as ET
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from collections import Counter
+from flask import Flask,request,jsonify,send_from_directory
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
+#过滤模型加载警告
+warnings.filterwarnings("ignore", category=UserWarning, message="Some weights of BertForSequenceClassification were not initialized from the model checkpoint.*")
+start_time = time.time()
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+# 定义情感维度和规则
+positive_rules = {
+    "高兴的": ["高兴", "开心", "快乐", "雀跃", "欢畅", "欢欣"],
+    "温和的": ["温和", "和蔼", "温柔", "和善", "慈祥", "平易"],
+    "放松的": ["放松", "自在", "悠闲", "惬意", "舒缓", "闲适"],
+    "安心的": ["安心", "放心", "安稳", "踏实", "宽心", "坦然"],
+    "喜爱的": ["喜爱", "喜欢", "钟爱", "热爱", "爱慕", "贪恋"],
+}
+negative_rules = {
+    "悲伤的": ["难过", "伤心", "悲痛", "哀伤", "哀愁", "悲戚", "酸楚"],
+    "愤怒的": ["愤怒", "?!", "生气", "发火", "恼怒", "愤慨", "盛怒"],
+    "紧张的": ["焦虑", "担忧", "担心", "发愁", "迷茫", "慌张", "局促", "忐忑"],
+    "害怕的": ["害怕", "恐惧", "惧怕", "惊恐", "胆寒", "胆怯", "畏惧"],
+    "厌恶的": ["厌恶", "讨厌", "憎恶", "嫌弃", "反感", "鄙夷", "唾弃"],
+}
+# 风格类规则
+style_rules = {
+    "简约的": [],
+    "话痨的": [],
+    "有文化的": []  # 不使用关键词匹配
+}
+# 合并正负规则
+all_rules = {**positive_rules, **negative_rules, **style_rules}
+# 定义情感维度和风格维度，5个维度
+emotion_dimensions = ["情绪高低", "态度温和", "身心松弛", "内心安稳", "喜爱程度"]
+# 为标签定义向量表示，5 个维度
+label_vectors = {
+    "高兴的": np.array([6, 0, 0, 0, 2]),
+    "悲伤的": np.array([-6, 0, 0, 0, -2]),
+    "愤怒的": np.array([0, -6, -2, 0, -2]),
+    "温和的": np.array([0, 6, 2, 3, 0]),
+    "紧张的": np.array([0, 0, -6, -2, 0]),
+    "放松的": np.array([0, 2, 6, 2, 0]),
+    "安心的": np.array([0, 2, 2, 6, 0]),
+    "害怕的": np.array([0, 0, -2, -6, -2]),
+    "喜爱的": np.array([2, 2, -1, 0, 6]),
+    "厌恶的": np.array([-1, -1, -1, -1, -6]),
+}
+# 扩展否定词列表
+negation_words = ["不", "没有", "没", "非", "无", "勿", "别", "休", "未"]
+degree_adverbs = {
+    "非常": 2,
+    "极其": 2.5,
+    "特别": 2,
+    "有点": 0.5,
+    "稍微": 0.5,
+    "稍": 0.3,
+    "万分": 4,
+    "格外": 2,
+    "略微": 0.3,
+    "十分": 2
+}
+DEBUG=False
+max_length=64
+# 保存文件的目录
+save_dir = r"F:\labeled_texts"
+# 定义情感类和风格类维度的索引范围
+emotion_index_range = slice(0, 5)
+style_index_range = slice(5, 7)
+emotion_labels = ["高兴的", "悲伤的", "愤怒的", "温和的", "紧张的", "放松的", "安心的", "害怕的", "喜爱的", "厌恶的", "中性"]
+style_labels = ["简约的", "话痨的", "有文化的", "无"]
+# 对情感类标签进行编码
+emotion_label_encoder = LabelEncoder()
+emotion_label_encoder.fit(emotion_labels)
+# 对风格类标签进行编码
+style_label_encoder = LabelEncoder()
+style_label_encoder.fit(style_labels)
+local_bert_path = r'F:\hfl'
+# 加载 BertModel 用于获取词向量
+tokenizer = BertTokenizer.from_pretrained(local_bert_path)
+embedding_model = BertModel.from_pretrained(local_bert_path)
+# 加载 DistilBertForSequenceClassification 用于分类
+classification_model = AutoModelForSequenceClassification.from_pretrained(local_bert_path)
+# 获取词语的词向量
+def get_word_embeddings(word):
+    if isinstance(word, list):
+        return [get_word_embeddings(w) for w in word]
+    inputs = tokenizer(word, return_tensors='pt', truncation=True, max_length=512)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    outputs = embedding_model(**inputs)
+    embedding = outputs.last_hidden_state.mean(dim=1).squeeze()
+    return embedding
+# 计算词语之间的余弦相似度
+def similarity(word1, word2):
+    embedding1 = get_word_embeddings(word1)
+    embedding2 = get_word_embeddings(word2)
+    cos_sim = torch.nn.functional.cosine_similarity(embedding1, embedding2, dim=0)
+    return cos_sim.item()
+# 计算余弦相似度的函数
+def cosine_similarity(vector1, vector2):
+    dot_product = np.dot(vector1, vector2)
+    norm_vector1 = np.linalg.norm(vector1)
+    norm_vector2 = np.linalg.norm(vector2)
+    if norm_vector1 == 0 or norm_vector2 == 0:
+        return 0
+    return dot_product / (norm_vector1 * norm_vector2)
+#处理单个文件
+def process_single_file(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            texts = []
+            for item in data:
+                if 'content' in item:
+                    texts.append(item['content'])
+            return texts
+    except json.JSONDecodeError:
+        return []
+# 分析函数
+def analyze_emotion(text, emotion_dimensions, label_vectors, index, all_keywords, get_word_embeddings):
+    if not keyword_pattern.search(text):
+        return [0] * len(emotion_dimensions)
+    emotion_vector = [0] * len(emotion_dimensions)
+    words = thu.cut(text, text=True).split()
+    similarity_threshold = 0.7  # 相似度阈值，可根据实际情况调整
+    for i, word in enumerate(words):
+        negation_multiplier = 1
+        degree_multiplier = 1
+        if i > 0 and words[i - 1] in negation_words:
+            negation_multiplier = -1
+        if i > 0 and words[i - 1] in degree_adverbs:
+            degree_multiplier = degree_adverbs[words[i - 1]]
+        word_embedding = get_word_embeddings(word).detach().cpu().numpy().reshape(1, -1)
+        distances, indices = index.search(word_embedding, 1)
+        if distances[0][0] < 0.7:
+            keyword = all_keywords[indices[0][0]]
+            # 使用 similarity 函数进一步判断语义相似度
+            sim = similarity(word, keyword)
+            if sim > similarity_threshold:
+                sub_label = keyword_to_label[keyword]
+                if sub_label in all_rules:
+                    adj_vector = label_vectors[sub_label]
+                    for dim_index in range(len(emotion_vector)):
+                        emotion_vector[dim_index] += adj_vector[dim_index] * degree_multiplier * negation_multiplier
+    return emotion_vector
+# 存储已处理的 JSON 文件路径
+processed_json_files = set()
+#加载函数
+def load_data(folder_path, sample_ratio=0.03):
+    all_texts = []
+    all_labels = []
+    # 获取所有 JSON 文件
+    json_files = [os.path.join(folder_path, file) for file in os.listdir(folder_path) if file.endswith('.json')]
+    # 过滤掉已处理的 JSON 文件
+    unprocessed_json_files = [f for f in json_files if f not in processed_json_files]
+    if not unprocessed_json_files:
+        print("所有 JSON 文件都已处理过。")
+        return all_texts, all_labels
+    # 随机选择一个未处理的 JSON 文件
+    selected_file = random.choice(unprocessed_json_files)
+    try:
+        with open(selected_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            # 检查文件是否已标记为已处理
+            if isinstance(data, list) and any(isinstance(item, dict) and item.get('labeled', False) for item in data):
+                print(f"文件 {selected_file} 已处理，跳过。")
+                processed_json_files.add(selected_file)
+                return load_data(folder_path, sample_ratio)
+            labels = set()
+            for item in data:
+                if 'dataType' in item:
+                    labels.add(item['dataType'])
+            if len(labels) > 1:
+                sampled_data = random.sample(data, int(len(data) * sample_ratio))
+                for item in sampled_data:
+                    if 'content' in item:
+                        all_texts.append(item['content'])
+                        all_labels.append('待标注')
+                # 标记文件为已处理
+                if isinstance(data, list):
+                    data.append({"labeled": True})
+                else:
+                    data = [data, {"labeled": True}]
+                with open(selected_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=4)
+                processed_json_files.add(selected_file)
+            else:
+                print(f"文件 {selected_file} 不符合条件（标签种类少于等于 1），跳过。")
+                processed_json_files.add(selected_file)
+                return load_data(folder_path,  sample_ratio)
+    except json.JSONDecodeError:
+        print(f"JSON 解码错误，跳过文件: {selected_file}")
+        processed_json_files.add(selected_file)
+        return load_data(folder_path, sample_ratio)
+    return all_texts, all_labels
+# 保存数据的函数
+def save_labeled_data(texts, emotion_labels, style_labels, save_dir="./labeled_data"):
+    # 确保保存目录存在
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    # 生成时间戳
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    # 生成保存文件的路径
+    save_path = os.path.join(save_dir, f"labeled_data_{timestamp}.json")
+    labeled_data = []
+    emotion_counter = Counter()
+    style_counter = Counter()
+    for text, emotion_label, style_label in zip(texts, emotion_labels, style_labels):
+        labeled_data.append({
+            "text": text,
+            "emotion_label": emotion_label,
+            "style_label": style_label,
+            "is_labeled": True  # 添加已标注标记
+        })
+        # 统计情感标签出现次数
+        emotion_counter[emotion_label] += 1
+        # 处理风格标签，忽略分数信息
+        sub_labels = style_label.split(', ')
+        for sub_label in sub_labels:
+            if '(' in sub_label:
+                main_label = sub_label.split('(')[0]
+            elif ':' in sub_label:
+                main_label = sub_label.split(':')[0].strip()
+            else:
+                main_label = sub_label
+            style_counter[main_label] += 1
+    with open(save_path, 'w', encoding='utf-8') as f:
+        json.dump(labeled_data, f, ensure_ascii=False, indent=4)
+    print("情感形容词出现次数统计：")
+    for label, count in emotion_counter.items():
+        print(f"{label}: {count}")
+    print("\n风格形容词出现次数统计：")
+    for label, count in style_counter.items():
+        print(f"{label}: {count}")
+    return save_path
+# 保存模型的函数
+def save_trained_model(model, save_dir=r"F:\trainedmodels"):
+    # 确保保存目录存在
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+    # 生成时间戳
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    # 生成保存文件的路径
+    save_path = os.path.join(save_dir, f"model_{timestamp}.pth")
+    torch.save(model.state_dict(), save_path)
+    print(f"模型已保存到: {save_path}")
+    return save_path
+#加载保存了的数据
+def load_labeled_data(load_path):
+    with open(load_path, 'r', encoding='utf - 8') as f:
+        data = json.load(f)
+    labeled_texts = []
+    emotion_labels = []
+    style_labels = []
+    for item in data:
+        if item.get('is_labeled', False):
+            labeled_texts.append(item['text'])
+            emotion_labels.append(item['emotion_label'])
+            style_labels.append(item['style_label'])
+    return labeled_texts, emotion_labels, style_labels
+# 加载模型的函数
+def load_trained_model(model, load_path, device):
+    model.load_state_dict(torch.load(load_path, map_location=device))
+    model.to(device)
+    model.eval()
+    print(f"模型已从 {load_path} 加载")
+    return model
+# 定义一个函数来加载 XML 文件数据并进行标注
+def load_and_label_xml(xml_file_path, save_path):
+    # 检查本地是否已保存标注结果
+    culture_count = 0
+    if os.path.exists(save_path):
+        with open(save_path, 'r', encoding='utf-8') as f:
+            labeled_data = json.load(f)
+        print("已加载本地保存的标注结果。")
+    else:
+        try:
+            tree = ET.parse(xml_file_path)
+            root = tree.getroot()
+            # 提取命名空间
+            namespace = dict([node for _, node in ET.iterparse(xml_file_path, events=['start-ns'])])
+            ns = next(iter(namespace.values()))
+            t_tag = f"{{{ns}}}t"
+            labeled_data = []
+            for element in root.findall(f'.//{t_tag}'):
+                text = element.text
+                if text:
+                    all_texts.append(text)
+                    all_labels.append('有文化的')
+                    culture_count += 1
+                    # 将文本和标签组合成字典并添加到 labeled_data 列表
+                    labeled_data.append({
+                        "text": text,
+                        "label": "有文化的"
+                    })
+            # 保存标注结果到本地
+            with open(save_path, 'w', encoding='utf-8') as f:
+                json.dump(labeled_data, f, ensure_ascii=False, indent=4)
+            print("已完成标注并保存结果到本地。")
+        except FileNotFoundError:
+            print(f"未找到指定的 XML 文件: {xml_file_path}")
+        except PermissionError:
+            print(f"没有权限访问 XML 文件: {xml_file_path}")
+        except Exception as e:
+            print(f"读取 XML 文件时出错: {e}")
+            labeled_data = []
+    print(f"有文化的条目: {culture_count}")
+    return labeled_data
+def process_specific_json_files(file_paths, sample_ratio=1):
+    all_texts = []
+    all_labels = []
+    for selected_file in file_paths:
+        try:
+            with open(selected_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            # 对文件数据进行采样
+            sampled_data = random.sample(data, int(len(data) * sample_ratio))
+            for item in sampled_data:
+                if 'text' in item:
+                    all_texts.append(item['text'])
+                    all_labels.append(item.get('emotion_label', '待标注'))
+                    all_labels.append(item.get('style_label','待标注'))
+        except json.JSONDecodeError:
+            print(f"JSON 解码错误，跳过文件: {selected_file}")
+    return all_texts, all_labels
+# 提取文本特征
+def extract_features(texts):
+    features = []
+    for text in texts:
+        # 句子长度
+        sentence_length = len(text)
+        # 词汇丰富度（不同词汇的数量）
+        unique_words = len(set(text.split()))
+        # 标点符号频率
+        punctuation_count = sum([1 for char in text if char in ',.!?;'])
+        features.append([sentence_length, unique_words, punctuation_count])
+    return np.array(features)
+if __name__ == '__main__':
+    folder_path = r'F:\xunleidownload\WuDaoCorpus2.0_base_200G'
+    file_paths = [r'F:\labeled_texts\xmldata.json']
+    # xml_file_path = r'E:\quark\traditionalculture\xl\sharedStrings.xml'     # all_texts, all_labels = load_data(file_paths)
+    all_texts,all_labels=process_specific_json_files(file_paths)
+      model_path = local_bert_path
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    embedding_model.to(device)
+    classification_model.to(device)
+    #数据预处理
+    encoded_dict = tokenizer.batch_encode_plus(
+        all_texts,
+        add_special_tokens=True,
+        max_length=128,
+        padding='max_length',
+        return_attention_mask=True,
+        return_tensors='pt',
+        truncation=True
+    )
+    input_ids = encoded_dict['input_ids'].to(device)
+    attention_masks = encoded_dict['attention_mask'].to(device)
+    print(f"初始 attention_masks 长度: {len(attention_masks)}")
+    # 提取所有关键词
+    all_keywords = [keyword for sub_rules in all_rules.values() for keyword in sub_rules]
+    # 提前计算所有关键词的词向量并构建 Faiss 索引
+    keyword_embeddings = np.array([get_word_embeddings(keyword).detach().cpu().numpy() for keyword in all_keywords])
+    # 转换数据类型为 float32
+    keyword_embeddings = keyword_embeddings.astype(np.float32)
+    # 检查数据形状
+    if len(keyword_embeddings.shape) != 2:
+        # 如果不是二维数组，尝试进行调整
+        if len(keyword_embeddings.shape) == 1:
+            # 如果是一维数组，将其转换为二维数组
+            keyword_embeddings = keyword_embeddings.reshape(1, -1)
+        else:
+            # 对于更高维度的数组，根据实际情况进行处理
+            keyword_embeddings = keyword_embeddings.reshape(-1, keyword_embeddings.shape[-1])
+    print(f"keyword_embeddings 的形状: {keyword_embeddings.shape}")
+    d = keyword_embeddings.shape[1]
+    index = faiss.IndexFlatL2(d)
+    try:
+        index.add(keyword_embeddings)
+        print("Faiss 索引添加成功")
+    except Exception as e:
+        print(f"添加到 Faiss 索引时出现错误: {e}")
+    # 构建关键词正则表达式模式
+    keyword_pattern = re.compile('|'.join(re.escape(keyword) for keyword in all_keywords))
+    thu = thulac.thulac(seg_only=True)
+    keyword_to_label = {}
+    for sub_label, keywords in all_rules.items():
+        for keyword in keywords:
+            keyword_to_label[keyword] = sub_label
+    # 进行初步标注
+    model_auto = AutoModelForSequenceClassification.from_pretrained(model_path, num_labels=3, ignore_mismatched_sizes=True)
+    model_auto.to(device)
+    batch_size = 8  # 可根据显存调整批次大小
+    preliminary_labels = []
+    for i in range(0, len(all_texts), batch_size):
+        batch_input_ids = input_ids[i:i + batch_size].to(device)
+        batch_attention_masks = attention_masks[i:i + batch_size].to(device)
+        with torch.no_grad():
+            outputs = model_auto(batch_input_ids, attention_mask=batch_attention_masks).logits
+            predicted_class_ids = outputs.argmax(dim=1).tolist()
+        label_mapping = {0: '消极', 1: '中性', 2: '积极'}
+        batch_labels = [label_mapping[class_id] for class_id in predicted_class_ids]
+        preliminary_labels.extend(batch_labels)
+    emotional_vectors = []
+    for text in all_texts:
+        emotional_vectors.append(analyze_emotion(text, emotion_dimensions, label_vectors, index, all_keywords, get_word_embeddings))
+    detailed_labels_list = []
+
+    avg_length = np.mean([len(text) for text in all_texts])
+    length_scores = []
+    for text, vector, label in zip(all_texts, emotional_vectors, all_labels):
+        max_similarity = -1
+        emotion_label = "中性"
+        for sub_label, vec in label_vectors.items():
+            similarity = cosine_similarity(vector, vec)
+            if similarity > max_similarity:
+                max_similarity = similarity
+                emotion_label = sub_label
+        if max_similarity < 0.3:
+            emotion_label = "中性"
+        print(f"文本: {text}, 情感标签: {emotion_label}")
+        # 确定风格类标签
+        current_style_labels = []
+        length_score = (len(text) - avg_length) / avg_length
+        if length_score < -0.75:
+            current_style_labels.append(f"简约的")
+        elif length_score > 0.75:
+            current_style_labels.append(f"话痨的")
+        else:
+            current_style_labels.append("无")
+        if label == '有文化的':
+            current_style_labels.append('有文化的')
+        if not current_style_labels:
+            style_label = "无"
+        else:
+            style_label = ", ".join(current_style_labels)
+        print(f"文本: {text}, 风格标签: {style_label}")
+        detailed_labels = [emotion_label, style_label]
+        detailed_labels_list.append(detailed_labels)
+    # 分离情感类和风格类标签
+    extracted_emotion_labels = [labels[0] for labels in detailed_labels_list]
+    extracted_style_labels = [labels[1] for labels in detailed_labels_list]
+    # 使用之前定义好的编码器进行编码
+    encoded_emotion_labels = emotion_label_encoder.transform(extracted_emotion_labels)
+    encoded_style_labels = style_label_encoder.transform(extracted_style_labels)
+    # 组合编码后的标签
+    encoded_labels = np.column_stack((encoded_emotion_labels, encoded_style_labels))
+    encoded_labels = torch.tensor(encoded_labels).to(device)  # 将 encoded_labels 移到 GPU 上
+    print(f"encoded_labels 形状: {encoded_labels.shape}")
+    # 输出结果
+    for text, vector, labels in zip(all_texts, emotional_vectors, detailed_labels_list):
+        print(f"文本: {text}")
+        print(f"情感向量: {vector}")
+        print(f"细分标签: {', '.join(labels)}")
+        print()
+    save_path = save_labeled_data(all_texts, extracted_emotion_labels, extracted_style_labels, save_dir)
+    label_Finish_time=time.time()-start_time
+    print(f"标注数据已保存到：{save_path}")
+    print(f"贴标签所用时间：{label_Finish_time}秒")
+
+
+
+->附录2 模型训练与生成测试阶段的代码
+#!pip install faiss-cpu
+#!pip install thulac
+#!pip install rouge_score
+import os
+import ujson as json
+import random
+import numpy as np
+import torch
+from torch.utils.data import Dataset,DataLoader,TensorDataset
+from sklearn.preprocessing import LabelEncoder,MultiLabelBinarizer
+from torch.amp import GradScaler,autocast
+import thulac
+from torch import nn
+from transformers import AutoModel, BertConfig
+import warnings
+import functools
+import concurrent.futures
+import re
+import faiss
+import time
+from sklearn.metrics import accuracy_score, f1_score,recall_score
+import xml.etree.ElementTree as ET
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from collections import Counter
+from flask import Flask,request,jsonify,send_from_directory
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AdamW, BertTokenizer,BertModel
+import shutil
+from sklearn.model_selection import train_test_split
+from imblearn.over_sampling import SMOTE
+from nltk.translate.bleu_score import sentence_bleu
+from rouge_score import rouge_scorer
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+torch.cuda.empty_cache()
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+# 重置 CUDA 上下文
+os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'  # 确保能看到两个 GPU
+# 定义正则表达式模式来匹配警告信息
+pattern = r"unknown class\(es\) \[.*\] will be ignored"
+# 过滤特定的 UserWarning
+warnings.filterwarnings("ignore", category=UserWarning, message=pattern, module="sklearn")
+# 定义情感维度和规则
+positive_rules = {
+    "高兴的": ["高兴", "开心", "快乐", "雀跃", "欢畅", "欢欣"],
+    "温和的": ["温和", "和蔼", "温柔", "和善", "慈祥", "平易"],
+    "放松的": ["放松", "自在", "悠闲", "惬意", "舒缓", "闲适"],
+    "安心的": ["安心", "放心", "安稳", "踏实", "宽心", "坦然"],
+    "喜爱的": ["喜爱", "喜欢", "钟爱", "热爱", "爱慕", "贪恋"],
+}
+negative_rules = {
+    "悲伤的": ["难过", "伤心", "悲痛", "哀伤", "哀愁", "悲戚", "酸楚"],
+    "愤怒的": ["愤怒", "?!", "生气", "发火", "恼怒", "愤慨", "盛怒"],
+    "紧张的": ["焦虑", "担忧", "担心", "发愁", "迷茫", "慌张", "局促", "忐忑"],
+    "害怕的": ["害怕", "恐惧", "惧怕", "惊恐", "胆寒", "胆怯", "畏惧"],
+    "厌恶的": ["厌恶", "讨厌", "憎恶", "嫌弃", "反感", "鄙夷", "唾弃"],
+}
+# 风格类规则
+style_rules = {
+    "简约的": [],
+    "话痨的": [],
+    "有文化的": []  # 不使用关键词匹配
+}
+# 合并正负规则
+all_rules = {**positive_rules, **negative_rules, **style_rules}
+# 定义情感维度和风格维度，5个维度
+emotion_dimensions = ["情绪高低", "态度温和", "身心松弛", "内心安稳", "喜爱程度"]
+# 为标签定义向量表示，5 个维度
+label_vectors = {
+    "高兴的": np.array([6, 0, 0, 0, 2]),
+    "悲伤的": np.array([-6, 0, 0, 0, -2]),
+    "愤怒的": np.array([0, -6, -2, 0, -2]),
+    "温和的": np.array([0, 6, 2, 3, 0]),
+    "紧张的": np.array([0, 0, -6, -2, 0]),
+    "放松的": np.array([0, 2, 6, 2, 0]),
+    "安心的": np.array([0, 2, 2, 6, 0]),
+    "害怕的": np.array([0, 0, -2, -6, -2]),
+    "喜爱的": np.array([2, 2, -1, 0, 6]),
+    "厌恶的": np.array([-1, -1, -1, -1, -6]),
+}
+# 扩展否定词列表
+negation_words = ["不", "没有", "没", "非", "无", "勿", "别", "休", "未"]
+degree_adverbs = {
+    "非常": 2,
+    "极其": 2.5,
+    "特别": 2,
+    "有点": 0.5,
+    "稍微": 0.5,
+    "稍": 0.3,
+    "万分": 4,
+    "格外": 2,
+    "略微": 0.3,
+    "十分": 2
+}
+emotion_labels = ["高兴的", "悲伤的", "愤怒的", "温和的", "紧张的", "放松的", "安心的", "害怕的", "喜爱的",
+                  "厌恶的", "中性"]
+style_labels = ["简约的", "话痨的", "有文化的", "无"]
+max_length=32
+shutil.copytree('/kaggle/input','/kaggle/working/inputs_copy')
+def process_specific_json_files(file_paths, sample_ratio=1):
+    all_texts = []
+    all_labels = []
+    for selected_file in file_paths:
+        try:
+            with open(selected_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            # 对文件数据进行采样
+            sampled_data = random.sample(data, int(len(data) * sample_ratio))
+            for item in sampled_data:
+                if 'text' in item:
+                    all_texts.append(item['text'])
+                    # 同时获取情感标签和风格标签，组成元组添加到 all_labels 中
+                    emotion_label = item.get('emotion_label', '待标注')
+                    style_label = item.get('style_label', ['待标注'])
+                    all_labels.append((emotion_label, style_label))
+        except json.JSONDecodeError:
+            print(f"JSON 解码错误，跳过文件: {selected_file}")
+    return all_texts, all_labels
+class TextDataset(Dataset):
+    def __init__(self, texts, labels, target_texts, tokenizer, max_length, emotion_label_encoder, style_label_encoder, pre_encoded=False):
+        self.texts = texts
+        self.labels = labels
+        self.target_texts = target_texts
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.pre_encoded = pre_encoded
+        self.emotion_label_encoder = emotion_label_encoder
+        self.style_label_encoder = style_label_encoder
+        if pre_encoded:
+            # 如果已经预编码，假设 labels 是 (input_ids, attention_masks, emotion_labels, style_labels) 元组
+            self.input_ids, self.attention_masks, self.emotion_labels, self.style_labels = labels
+        else:
+            # 不进行预编码，后续动态编码
+            self.emotion_labels = [label[0] for label in labels]
+            self.style_labels = [label[1] for label in labels]
+        # 检查数据长度是否一致
+        if pre_encoded:
+            assert len(self.input_ids) == len(self.attention_masks) == len(self.emotion_labels) == len(self.style_labels), "数据长度不一致"
+        else:
+            assert len(self.texts) == len(self.emotion_labels) == len(self.style_labels), "数据长度不一致"
+    def __getitem__(self, idx):
+        if self.pre_encoded:
+            return self.input_ids[idx], self.attention_masks[idx], self.emotion_labels[idx], self.style_labels[idx]
+        else:
+            text = self.texts[idx]
+            emotion_label = self.emotion_labels[idx]
+            style_label = self.style_labels[idx]
+            encoding = self.tokenizer.encode_plus(
+                text,
+                add_special_tokens=True,
+                max_length=self.max_length,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            input_ids = encoding['input_ids'].flatten()
+            attention_mask = encoding['attention_mask'].flatten()
+            # 对标签进行编码
+            emotion_encoded_label = self.emotion_label_encoder.transform([emotion_label])[0]
+            # 确保 style_label 是列表形式
+            if not isinstance(style_label, list):
+                style_label = [style_label]
+            style_encoded_label = self.style_label_encoder.transform([style_label])[0]
+            # 获取当前样本对应的目标文本
+            target_text = self.target_texts[idx]
+            # 对目标文本进行编码
+            target_encoding = self.tokenizer.encode_plus(
+                target_text,
+                add_special_tokens=True,
+                max_length=self.max_length,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            target_ids = target_encoding['input_ids'].squeeze()
+            padded_style_label = style_encoded_label[:4].tolist()
+            if len(padded_style_label) < 4:
+                padded_style_label.extend([0] * (4 - len(padded_style_label)))
+
+            return input_ids, attention_mask, emotion_encoded_label, padded_style_label, target_ids
+    def __len__(self):
+        return len(self.emotion_labels)
+class CustomModel(nn.Module):
+    def __init__(self, chinese_bert_path, num_emotion_classes, num_style_classes):
+        super(CustomModel, self).__init__()
+        self.chinese_bert = BertModel.from_pretrained(chinese_bert_path)
+        self.emotion_classifier = nn.Sequential(
+            nn.Linear(self.chinese_bert.config.hidden_size, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(32, num_emotion_classes)
+        )
+        self.style_classifier = nn.Sequential(
+            nn.Linear(self.chinese_bert.config.hidden_size, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(32, num_style_classes)
+        )
+        # 添加解码器用于文本生成
+        self.decoder = nn.Linear(self.chinese_bert.config.hidden_size, self.chinese_bert.config.vocab_size)
+    def forward(self, input_ids, attention_mask):
+        outputs = self.chinese_bert(input_ids=input_ids, attention_mask=attention_mask)
+        last_hidden_state = outputs.last_hidden_state  # 获取整个序列的隐藏状态
+        # 情感分类：使用 [CLS] 标记的隐藏状态
+        pooled_output = outputs.pooler_output
+        emotion_logits = self.emotion_classifier(pooled_output)
+        # 风格分类：使用 [CLS] 标记的隐藏状态
+        style_logits = self.style_classifier(pooled_output)
+        # 文本生成：使用整个序列的隐藏状态和 decoder 层
+        generation_logits = self.decoder(last_hidden_state)
+        return emotion_logits, style_logits, generation_logits
+    def generate(self, input_ids, attention_mask, max_length=50, num_beams=1, do_sample=False, temperature=1.0):
+        """
+        生成文本的方法
+        :param input_ids: 输入的 token ids
+        :param attention_mask: 注意力掩码
+        :param max_length: 最大生成长度
+        :param num_beams: 束搜索的束宽
+        :param do_sample: 是否使用采样策略
+        :param temperature: 采样温度
+        :return: 生成的 token ids
+        """
+        device = input_ids.device
+        input_length = input_ids.size(1)
+        generated_ids = input_ids.clone()
+        for _ in range(max_length - input_length):
+            _, _, generation_logits = self.forward(generated_ids, attention_mask)
+            next_token_logits = generation_logits[:, -1, :]  # 取最后一个时间步的 logits
+            if do_sample:
+                # 使用采样策略
+                probs = torch.softmax(next_token_logits / temperature, dim=-1)
+                next_token_id = torch.multinomial(probs, num_samples=1)
+            else:
+                # 使用束搜索或贪心搜索
+                if num_beams > 1:
+                    # 这里简单实现为贪心搜索，可根据需求扩展为束搜索
+                    next_token_id = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                else:
+                    next_token_id = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+            generated_ids = torch.cat([generated_ids, next_token_id], dim=1)
+        return generated_ids
+def train_model(model, train_dataloader, val_dataloader, optimizer, emotion_criterion, style_criterion, generation_criterion, scheduler, device, epochs=3, accumulation_steps=4, save_dir='/kaggle/working'):
+    """
+    训练模型的函数，支持训练集和验证集，可进行梯度累积和混合精度训练
+    :param model: 训练的模型
+    :param train_dataloader: 训练集的数据加载器
+    :param val_dataloader: 验证集的数据加载器
+    :param optimizer: 优化器
+    :param emotion_criterion: 情感分类损失函数
+    :param style_criterion: 风格分类损失函数
+    :param generation_criterion: 生成任务损失函数
+    :param scheduler: 学习率调度器
+    :param device: 训练设备
+    :param epochs: 训练轮数
+    :param accumulation_steps: 梯度累积步数
+    :param save_dir: 模型保存目录
+    :return: 训练好的模型
+    """
+    best_val_loss = float('inf')  # 初始化最佳验证损失为正无穷
+    model.train()
+    scaler = GradScaler()  # 用于混合精度训练的梯度缩放器
+    for epoch in range(epochs):
+        total_train_loss = 0
+        running_loss = 0
+        for i, (input_ids, attention_masks, emotion_labels, style_labels, target_ids) in enumerate(train_dataloader):
+            input_ids = input_ids.to(device)
+            attention_masks = attention_masks.to(device)
+            emotion_labels = emotion_labels.to(device)
+            style_labels = style_labels.to(device)
+            target_ids = target_ids.to(device)
+            with autocast(device_type='cuda'):  # 自动混合精度上下文
+                # 前向传播
+                emotion_outputs, style_outputs, generation_outputs = model(input_ids, attention_masks)
+                # 确保数据类型一致
+                style_outputs = style_outputs.to(torch.float32)
+                style_labels = style_labels.to(torch.float32)
+                style_labels = torch.clamp(style_labels, 0, 1)
+                # 计算损失
+                emotion_loss = emotion_criterion(emotion_outputs, emotion_labels)
+                style_loss = style_criterion(style_outputs, style_labels)
+                batch_size, sequence_length, vocab_size = generation_outputs.size()
+                generation_outputs = generation_outputs.view(-1, vocab_size)
+                target_ids = target_ids.view(-1)
+                generation_loss = generation_criterion(generation_outputs, target_ids)
+                total_loss = emotion_loss + style_loss + generation_loss
+                running_loss += total_loss.item()
+                total_train_loss += total_loss.item()
+            # 缩放损失并进行反向传播
+            scaler.scale(total_loss / accumulation_steps).backward()
+            # 梯度累积
+            if (i + 1) % accumulation_steps == 0:
+                scaler.step(optimizer)  # 更新参数
+                scaler.update()  # 更新缩放因子
+                optimizer.zero_grad()
+            # 释放不必要的张量
+            del input_ids, attention_masks, emotion_labels, style_labels, target_ids
+            del emotion_outputs, style_outputs, generation_outputs
+        scheduler.step()
+        # 验证阶段
+        model.eval()
+        total_val_loss = 0
+        all_emotion_preds = []  # 用于收集情感分类的预测结果
+        all_emotion_labels = []  # 用于收集情感分类的真实标签
+        all_style_preds = []  # 用于收集风格分类的预测结果
+        all_style_labels = []  # 用于收集风格分类的真实标签
+        with torch.no_grad():
+            for input_ids, attention_masks, emotion_labels, style_labels, target_ids in val_dataloader:
+                input_ids = input_ids.to(device)
+                attention_masks = attention_masks.to(device)
+                emotion_labels = emotion_labels.to(device)
+                style_labels = style_labels.to(device)
+                target_ids = target_ids.to(device)
+                with autocast(device_type='cuda'):  # 自动混合精度上下文，指定设备类型为 cuda
+                    emotion_outputs, style_outputs, generation_outputs = model(input_ids, attention_masks)
+                    # 确保数据类型一致
+                    style_outputs = style_outputs.to(torch.float32)
+                    style_labels = style_labels.to(torch.float32)
+                    emotion_loss = emotion_criterion(emotion_outputs, emotion_labels)
+                    style_loss = style_criterion(style_outputs, style_labels)
+                    batch_size, sequence_length, vocab_size = generation_outputs.size()
+                    generation_outputs = generation_outputs.view(-1, vocab_size)
+                    target_ids = target_ids.view(-1)
+                    generation_loss = generation_criterion(generation_outputs, target_ids)
+                    total_val_loss += (emotion_loss + style_loss + generation_loss).item()
+                # 添加情感分类的预测结果和真实标签
+                emotion_preds = torch.argmax(emotion_outputs, dim=1).cpu().numpy()
+                emotion_labels = emotion_labels.cpu().numpy()
+                all_emotion_preds.extend(emotion_preds)
+                all_emotion_labels.extend(emotion_labels)
+                # 添加风格分类的预测结果和真实标签
+                style_preds = (torch.sigmoid(style_outputs) > 0.5).float().cpu().numpy()
+                style_labels = style_labels.cpu().numpy()
+                all_style_preds.extend(style_preds)
+                all_style_labels.extend(style_labels)
+                # 释放不必要的张量
+                del input_ids, attention_masks, emotion_labels, style_labels, target_ids
+                del emotion_outputs, style_outputs, generation_outputs
+        avg_train_loss = total_train_loss / len(train_dataloader)
+        avg_val_loss = total_val_loss / len(val_dataloader)
+        # 计算情感分类的评估指标
+        emotion_accuracy = accuracy_score(all_emotion_labels, all_emotion_preds)
+        emotion_f1 = f1_score(all_emotion_labels, all_emotion_preds, average='weighted')
+        emotion_recall = recall_score(all_emotion_labels, all_emotion_preds, average='weighted')
+        # 计算风格分类的评估指标
+        all_style_preds = np.array(all_style_preds)
+        all_style_labels = np.array(all_style_labels)
+        style_accuracy = accuracy_score(all_style_labels.flatten(), all_style_preds.flatten())
+        style_f1 = f1_score(all_style_labels.flatten(), all_style_preds.flatten(), average='weighted')
+        style_recall = recall_score(all_style_labels.flatten(), all_style_preds.flatten(), average='weighted')
+        print(f'Epoch {epoch + 1}/{epochs}, Train Loss: {avg_train_loss}, Val Loss: {avg_val_loss}')
+        print(f'Emotion - Accuracy: {emotion_accuracy}, F1: {emotion_f1}, Recall: {emotion_recall}')
+        print(f'Style - Accuracy: {style_accuracy}, F1: {style_f1}, Recall: {style_recall}')
+        # 生成任务评估
+        generated_texts = []
+        reference_texts = []
+        all_emotions = []
+        all_styles = []
+        emotion_int_to_str = {idx: label for idx, label in enumerate(emotion_label_encoder.classes_)}
+        for input_ids, attention_masks, emotion_labels, style_labels, target_ids in val_dataloader:
+            input_text = tokenizer.decode(input_ids[0], skip_special_tokens=True)
+            reference_text = tokenizer.decode(target_ids[0], skip_special_tokens=True)
+            emotion_labels = emotion_labels.cpu().numpy()
+            style_labels = style_labels.cpu().numpy()
+            for emotion in emotion_labels:
+                emotion_str = emotion_int_to_str[emotion]  # 将整数编码转换为字符串标签
+                for style in style_labels:
+                    generated_text = generate_reply(input_text, [emotion_str], [style], model, tokenizer, emotion_label_encoder, style_label_encoder, device)
+                    generated_texts.append(generated_text)
+                    reference_texts.append(reference_text)
+                    all_emotions.append(emotion)
+                    all_styles.append(style)
+        # 计算传统评估指标
+        bleu_scores = []
+        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        rouge1_scores = []
+        rouge2_scores = []
+        rougeL_scores = []
+        for generated_text, reference_text in zip(generated_texts, reference_texts):
+            # 计算 BLEU 分数
+            smooth = SmoothingFunction().method1
+            bleu_score = sentence_bleu([reference_text.split()], generated_text.split(), smoothing_function=smooth)
+            bleu_scores.append(bleu_score)
+            # 计算 ROUGE 分数
+            scores = scorer.score(reference_text, generated_text)
+            rouge1_scores.append(scores['rouge1'].fmeasure)
+            rouge2_scores.append(scores['rouge2'].fmeasure)
+            rougeL_scores.append(scores['rougeL'].fmeasure)
+        avg_bleu = sum(bleu_scores) / len(bleu_scores)
+        avg_rouge1 = sum(rouge1_scores) / len(rouge1_scores)
+        avg_rouge2 = sum(rouge2_scores) / len(rouge2_scores)
+        avg_rougeL = sum(rougeL_scores) / len(rougeL_scores)
+        print(f"Average BLEU score: {avg_bleu}")
+        print(f"Average ROUGE - 1 score: {avg_rouge1}")
+        print(f"Average ROUGE - 2 score: {avg_rouge2}")
+        print(f"Average ROUGE - L score: {avg_rougeL}")
+        # 保存最优模型
+        if total_val_loss < best_val_loss:
+            best_val_loss = total_val_loss
+            save_trained_model(model, optimizer, save_dir)
+        # 每轮结束后清理 GPU 缓存
+        torch.cuda.empty_cache()
+    return model
+def save_trained_model(model, optimizer, save_dir='/kaggle/working'):
+    """
+    保存模型和优化器的状态
+    :param model: 训练的模型
+    :param optimizer: 优化器
+    :param save_dir: 保存目录
+    :return: 保存文件的路径
+    """
+    try:
+        # 检查保存目录是否存在，如果不存在则创建
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+            print(f"创建保存目录: {save_dir}")
+
+        # 生成带时间戳的文件名
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        save_path = os.path.join(save_dir, f"model_{timestamp}.pth")
+        # 处理使用 nn.DataParallel 包装的模型
+        if isinstance(model, torch.nn.DataParallel):
+            model_state_dict = model.module.state_dict()
+        else:
+            model_state_dict = model.state_dict()
+        # 保存模型和优化器的状态
+        torch.save({
+            'model_state_dict': model_state_dict,
+            'optimizer_state_dict': optimizer.state_dict()
+        }, save_path)
+        print(f"模型和优化器状态已成功保存到: {save_path}")
+        return save_path
+    except Exception as e:
+        print(f"保存模型和优化器状态时出现错误: {e}")
+        return None
+def load_trained_model(model, optimizer, load_path, device):
+    """
+    从指定路径加载模型和优化器的状态
+    :param model: 模型实例
+    :param optimizer: 优化器实例
+    :param load_path: 加载文件的路径
+    :param device: 设备（如 'cuda' 或 'cpu'）
+    :return: 加载后的模型和优化器
+    """
+    try:
+        # 检查加载路径是否存在
+        if not os.path.exists(load_path):
+            print(f"加载路径 {load_path} 不存在，请检查路径。")
+            return model, optimizer
+        # 加载保存的检查点
+        checkpoint = torch.load(load_path, map_location=device)
+        # 处理使用 nn.DataParallel 包装的模型
+        if isinstance(model, torch.nn.DataParallel):
+            model.module.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        # 加载优化器的状态
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # 将模型移动到指定设备并设置为训练模式
+        model.to(device)
+        model.train()
+        print(f"模型和优化器状态已从 {load_path} 成功加载")
+        return model, optimizer
+    except Exception as e:
+        print(f"加载模型和优化器状态时出现错误: {e}")
+        return model, optimizer
+def get_preliminary_emotion_label(text):
+    while True:
+        print(f"请为文本 '{text}' 标注初步情感标签（积极/消极/中性）: ")
+        preliminary_label = input().strip()
+        if preliminary_label in ['积极', '消极', '中性']:
+            return preliminary_label
+        print("输入无效，请输入积极/消极/中性。")
+def get_detailed_emotion_label(text, preliminary_label, emotion_labels):
+    print("传入的 emotion_labels:", emotion_labels)  # 添加调试输出
+    def clean_labels(labels):
+        cleaned = []
+        for label in labels:
+            if isinstance(label, torch.Tensor):
+                # 如果是 Tensor，将其转换为字符串
+                label_str = str(label.item()) if label.numel() == 1 else str(label)
+                cleaned.append(label_str)
+            else:
+                cleaned.append(str(label))
+        return cleaned
+    positive_emotion_labels = [label for label in emotion_labels if
+                               label not in ["悲伤的", "愤怒的", "紧张的", "害怕的", "厌恶的", "中性"]]
+    negative_emotion_labels = ["悲伤的", "愤怒的", "紧张的", "害怕的", "厌恶的"]
+    print("原始的积极情感标签列表:", positive_emotion_labels)  # 增加调试输出
+    positive_emotion_labels = clean_labels(positive_emotion_labels)
+    print("清理后的积极情感标签列表:", positive_emotion_labels)  # 增加调试输出
+    negative_emotion_labels = clean_labels(negative_emotion_labels)
+    if preliminary_label == '积极':
+        while True:
+            print(
+                f"文本 '{text}' 初步标注为积极，请从以下情感标签中选择进一步细分标签（{', '.join(positive_emotion_labels)}）: ")
+            emotion_detailed_label = input().strip()
+            if len(emotion_detailed_label) < 3:
+                print("输入的情感标签长度不符合要求，请输入完整的标签。")
+                continue
+            if emotion_detailed_label in positive_emotion_labels:
+                return emotion_detailed_label
+            print(f"输入的情感标签不在可选范围内，请从以下标签中选择（{', '.join(positive_emotion_labels)}）: ")
+    elif preliminary_label == '消极':
+        while True:
+            print(
+                f"文本 '{text}' 初步标注为消极，请从以下情感标签中选择进一步细分标签（{', '.join(negative_emotion_labels)}）: ")
+            emotion_detailed_label = input().strip()
+            if len(emotion_detailed_label) < 3:
+                print("输入的情感标签长度不符合要求，请输入完整的标签。")
+                continue
+            if emotion_detailed_label in negative_emotion_labels:
+                return emotion_detailed_label
+            print(f"输入的情感标签不在可选范围内，请从以下标签中选择（{', '.join(negative_emotion_labels)}）: ")
+    else:
+        return '中性'
+def get_style_label(text, style_labels):
+    while True:
+        print(f"文本 '{text}' 请从以下风格标签中选择（{', '.join(style_labels)}）: ")
+        user_input = input().strip()
+        if user_input == '无':
+            return '无'
+        elif ',' in user_input:  # 处理用户输入包含多个标签的情况
+            label_list = [label.strip() for label in user_input.split(',')]
+            for label in label_list:
+                if label not in style_labels:
+                    print(f"输入的风格标签 '{label}' 不在可选范围内，请重新输入。")
+                    break
+            else:
+                return label_list
+        elif user_input in style_labels:
+            return user_input
+        print(f"输入的风格标签不在可选范围内，请从以下标签中选择（{', '.join(style_labels)}）: ")
+def encode_texts(texts, tokenizer, max_length):
+    encoded_dict = tokenizer.batch_encode_plus(
+        texts,
+        add_special_tokens=True,
+        max_length=max_length,
+        padding='max_length',
+        return_attention_mask=True,
+        return_tensors='pt',
+        truncation=True
+    )
+    input_ids = encoded_dict['input_ids']
+    attention_masks = encoded_dict['attention_mask']
+    return input_ids, attention_masks
+def generate_reply(input_text, emotions, styles, model, tokenizer, emotion_label_encoder, style_label_encoder, device, max_length=256, num_beams=5, temperature=0.9):
+    # 对输入文本进行编码
+    encoding = tokenizer.encode_plus(
+        input_text,
+        add_special_tokens=True,
+        max_length=max_length,
+        padding='max_length',
+        truncation=True,
+        return_tensors='pt'
+    )
+    input_ids = encoding['input_ids'].to(device)
+    attention_mask = encoding['attention_mask'].to(device)
+    input_text_ids = input_ids  
+    try:
+        # 如果模型是 DataParallel 封装的，获取原模型
+        if isinstance(model, torch.nn.DataParallel):
+            original_model = model.module
+        else:
+            original_model = model
+        # 提前计算 BERT 输出
+        with torch.no_grad():
+            bert_output = original_model.chinese_bert(input_text_ids).last_hidden_state[:, 0, :]
+        # 处理多个风格标签
+        style_probs = []
+        valid_styles = []
+        for style in styles:
+            try:
+                style_id = style_label_encoder.transform([style])[0]
+                style_prob = torch.softmax(original_model.style_classifier(bert_output)[:, style_id], dim=0)
+                style_probs.append(style_prob)
+                valid_styles.append(style)
+            except ValueError:
+                print(f"Style '{style}' not found in style label encoder. Skipping...")
+        if not style_probs:
+            raise ValueError("No valid styles provided.")
+        # 可以考虑引入权重机制，这里暂时使用简单平均
+        avg_style_prob = sum(style_probs) / len(style_probs)
+        model.eval()
+        with torch.no_grad():
+            # 输入文本通过模型得到情感、风格和生成的 logits
+            emotion_logits, style_logits, generation_logits = model(input_ids, attention_mask)
+            # 处理多个情感标签
+            emotion_probs = []
+            valid_emotions = []
+            for emotion in emotions:
+                try:
+                    emotion_id = emotion_label_encoder.transform([emotion])[0]
+                    emotion_prob = torch.softmax(emotion_logits[:, emotion_id], dim=0)
+                    emotion_probs.append(emotion_prob)
+                    valid_emotions.append(emotion)
+                except ValueError:
+                    print(f"Invalid emotion label: {emotion}. Skipping...")
+                    continue
+            if not emotion_probs:
+                print("No valid emotions after skipping invalid ones. Returning default response.")
+                return "No valid emotions provided, unable to generate proper reply."
+
+            # 可以考虑引入权重机制，这里暂时使用简单平均
+            avg_emotion_prob = sum(emotion_probs) / len(emotion_probs)
+            # 引入温度参数对生成的 logits 进行调整
+            adjusted_logits = generation_logits / temperature
+            # 结合情感和风格概率，这里不直接相乘
+            combined_prob = avg_emotion_prob * avg_style_prob
+            # 使用 model.generate 方法生成回复
+            def custom_generate():
+                input_length = input_ids.size(1)
+                generated_ids = input_ids.clone()
+                sep_token_id = tokenizer.sep_token_id
+                prev_tokens = set(input_ids[0].tolist())
+                for _ in range(max_length - input_length):
+                    _, _, gen_logits = model(generated_ids, attention_mask)
+                    next_token_logits = gen_logits[:, -1, :] / temperature
+                    # 调整候选词元得分
+                    next_token_logits = next_token_logits * combined_prob
+                    probs = torch.softmax(next_token_logits, dim=-1)
+                    # 强制选择不在输入和已生成序列中的词元（除了特殊标记）
+                    valid_indices = [i for i in range(len(probs[0])) if i not in prev_tokens and i not in [tokenizer.cls_token_id, tokenizer.sep_token_id, tokenizer.pad_token_id]]
+                    if not valid_indices:
+                        break
+                    probs[0][[i for i in range(len(probs[0])) if i not in valid_indices]] = 0
+                    if num_beams > 1:
+                        # 束搜索逻辑（这里简化为贪心搜索）
+                        next_token_id = torch.argmax(probs, dim=-1, keepdim=True)
+                    else:
+                        next_token_id = torch.multinomial(probs, num_samples=1)
+                    generated_ids = torch.cat([generated_ids, next_token_id], dim=1)
+                    prev_tokens.add(next_token_id.item())
+                    # 检查是否生成了 [SEP] 标记
+                    if next_token_id.item() == sep_token_id:
+                        break
+                return generated_ids
+            output = custom_generate()
+            reply = tokenizer.decode(output[0], skip_special_tokens=True)
+            # 去除输入文本本身
+            reply = reply.replace(input_text, "").strip()
+            if not reply:
+                # 如果去除输入后没内容，再次尝试生成
+                temperature += 0.2
+                output = custom_generate()
+                reply = tokenizer.decode(output[0], skip_special_tokens=True)
+                reply = reply.replace(input_text, "").strip()
+                if not reply:
+                    reply = "未能生成有效的回复，请调整输入或参数。"
+        return reply
+    except Exception as e:
+        print(f"Error during reply generation: {e}")
+        return "Error occurred during reply generation."
+def format_style_labels(labels):
+    """
+    该函数用于将所有风格标签转换为列表形式
+    :param labels: 包含风格标签的数据列表
+    :return: 格式统一后的风格标签列表
+    """
+    formatted_labels = []
+    for label in labels:
+        if isinstance(label, str):
+            # 如果是单个字符串，将其转换为包含该字符串的列表
+            formatted_labels.append([label])
+        elif isinstance(label, list):
+            # 如果已经是列表，直接添加到结果列表中
+            formatted_labels.append(label)
+        else:
+            # 处理其他意外的数据类型
+            print(f"Unexpected data type: {type(label)} for {label}. Skipping...")
+    return formatted_labels
+def create_dataloaders(all_texts, all_labels, target_texts, tokenizer, emotion_label_encoder, style_label_encoder, test_size=0.2, batch_size=1):
+    dataset = TextDataset(all_texts, all_labels, target_texts, tokenizer, max_length=32,
+                          emotion_label_encoder=emotion_label_encoder,
+                          style_label_encoder=style_label_encoder)
+    input_ids_list = []
+    attention_masks_list = []
+    emotion_labels_list = []
+    style_labels_list = []
+    target_ids_list = []
+    for input_id, attention_mask, emotion_label, style_label, target_id in dataset:
+        input_ids_list.append(input_id)
+        attention_masks_list.append(attention_mask)
+        emotion_labels_list.append(emotion_label)
+        style_labels_list.append(style_label)
+        target_ids_list.append(target_id)
+    input_ids = torch.stack(input_ids_list)
+    attention_masks = torch.stack(attention_masks_list)
+    emotion_labels = torch.tensor(emotion_labels_list)
+    style_labels = torch.tensor(style_labels_list)
+    target_ids = torch.stack(target_ids_list)
+    input_ids_train, input_ids_val, \
+    attention_masks_train, attention_masks_val, \
+    emotion_labels_train, emotion_labels_val, \
+    style_labels_train, style_labels_val, \
+    target_ids_train, target_ids_val = train_test_split(
+        input_ids, attention_masks, emotion_labels, style_labels, target_ids,
+        test_size=test_size, random_state=42
+    )
+    train_dataset = TensorDataset(input_ids_train, attention_masks_train, emotion_labels_train, style_labels_train, target_ids_train)
+    val_dataset = TensorDataset(input_ids_val, attention_masks_val, emotion_labels_val, style_labels_val, target_ids_val)
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, pin_memory=True, num_workers=0,persistent_workers=False)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    return train_dataloader, val_dataloader
+class WeightedBCEWithLogitsLoss(nn.Module):
+    def __init__(self, weight=None):
+        super(WeightedBCEWithLogitsLoss, self).__init__()
+        self.weight = weight
+    def forward(self, input, target):
+        if self.weight is not None:
+            # 动态调整权重形状
+            batch_size = input.size(0)
+            adjusted_weight = self.weight[:batch_size]
+            loss = nn.functional.binary_cross_entropy_with_logits(input, target, weight=adjusted_weight)
+        else:
+            loss = nn.functional.binary_cross_entropy_with_logits(input, target)
+        return loss
+if __name__ == '__main__':
+    # 数据相关部分
+    file_paths = ['/kaggle/working/inputs_copy/58-7mb/labeled_data_20250215-212709.json',   '/kaggle/working/inputs_copy/traditionalculture/traditional_culture.json', ]
+    all_texts, all_labels = process_specific_json_files_enhance(file_paths)
+    target_texts = all_texts
+    print(f" target_texts 长度: {len(target_texts)}")
+    extracted_emotion_labels = [label[0] for label in all_labels]
+    extracted_style_labels = [label[1] for label in all_labels]
+    fixed_style_labels = format_style_labels_enhance(extracted_style_labels)
+    style_label_encoder = MultiLabelBinarizer()
+    style_label_encoder.fit(fixed_style_labels)
+    emotion_label_encoder = LabelEncoder()
+    emotion_label_encoder.fit(extracted_emotion_labels)
+    # 模型和分词器加载部分
+    model_path = '/kaggle/working/inputs_copy/chinese-bert-wwm-ext-model'
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 模型初始化相关部分
+    num_classes_emotion = 11
+    num_classes_style = 4
+    model = EnhancedCustomModel(model_path, num_classes_emotion, num_classes_style)
+    if torch.cuda.device_count() > 1:
+        print(f"使用 {torch.cuda.device_count()} 个 GPU 进行训练")
+        model = nn.DataParallel(model, device_ids=[0, 1])
+    model.to(device)
+    # 优化器和损失函数相关部分
+    optimizer = optim.SGD(model.parameters(), lr=0.001)
+    scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
+    # 第一次创建数据加载器（仅用于计算类别权重）
+    train_dataloader, val_dataloader = create_dataloaders_enhance(all_texts, all_labels, target_texts, tokenizer,
+                                                                  emotion_label_encoder, style_label_encoder)
+    emotion_labels_train_all = []
+    for _, _, batch_emotion_labels, _, _ in train_dataloader:
+        emotion_labels_train_all.extend(batch_emotion_labels)
+    emotion_class_counts = np.bincount(emotion_labels_train_all)
+    emotion_total_samples = len(emotion_labels_train_all)
+    emotion_class_weights = emotion_total_samples / (len(emotion_class_counts) * emotion_class_counts)
+    emotion_class_weights = torch.tensor(emotion_class_weights, dtype=torch.float32).to(device)
+    style_labels_train_all = []
+    for _, _, _, batch_style_labels, _ in train_dataloader:
+        style_labels_flat = batch_style_labels.view(-1).tolist()
+        style_labels_train_all.extend(style_labels_flat)
+    style_class_counts = np.bincount(style_labels_train_all)
+    style_total_samples = len(style_labels_train_all)
+    # 处理除零错误
+    epsilon = 1e-8  # 一个极小的数值，避免除零
+    style_class_weights = style_total_samples / (len(style_class_counts) * (style_class_counts + epsilon))
+    style_class_weights = torch.tensor(style_class_weights, dtype=torch.float32).to(device)
+    num_classes = 4
+    batch_size = train_dataloader.batch_size
+    if style_class_weights.size(0) < num_classes:
+        new_weights = torch.zeros(num_classes, dtype=torch.float32, device=device)
+        new_weights[:style_class_weights.size(0)] = style_class_weights
+        style_class_weights = new_weights
+    style_class_weights = style_class_weights.unsqueeze(0).expand(batch_size, -1)
+    emotion_criterion = nn.CrossEntropyLoss(weight=emotion_class_weights)
+    style_criterion = WeightedBCEWithLogitsLossEnhance(weight=style_class_weights)
+    generation_criterion = nn.CrossEntropyLoss()
+    # 加载之前保存的模型和优化器状态
+    #saved_model_path = '/kaggle/working/inputs_copy/20250323/pytorch/default/1/model_20250323-080227.pth'  # 根据实际保存的路径修改
+    #model, optimizer = load_trained_model_enhance(model, optimizer, saved_model_path, device)
+    #model.eval()
+    # 加载未标注数据
+    unlabeled_file_paths = ['/kaggle/working/inputs_copy/unlabeled/labeled_data_20250213-195050.json']  # 替换为实际未标注数据文件路径
+    unlabeled_texts, _ = process_specific_json_files_enhance(unlabeled_file_paths)
+    # 未标注数据编码
+    unlabeled_input_ids, unlabeled_attention_masks = encode_texts_enhance(unlabeled_texts, tokenizer, max_length=8)
+    unlabeled_input_ids = unlabeled_input_ids.to(device)
+    unlabeled_attention_masks = unlabeled_attention_masks.to(device)
+    # 分批次处理数据，避免显存不足
+    batch_size = 8
+    num_batches = len(unlabeled_texts) // batch_size + (1 if len(unlabeled_texts) % batch_size != 0 else 0)
+    all_emotion_logits = []
+    all_style_logits = []
+    for i in range(num_batches):
+        start_idx = i * batch_size
+        end_idx = min((i + 1) * batch_size, len(unlabeled_texts))
+        batch_input_ids = unlabeled_input_ids[start_idx:end_idx]
+        batch_attention_masks = unlabeled_attention_masks[start_idx:end_idx]
+        with torch.no_grad():
+            # 调整解包操作，接收三个输出
+            emotion_logits, style_logits, generation_logits = model(batch_input_ids, batch_attention_masks)
+            all_emotion_logits.append(emotion_logits.cpu())
+            all_style_logits.append(style_logits.cpu())
+        # 释放当前批次的输入数据
+        del batch_input_ids, batch_attention_masks
+        torch.cuda.empty_cache()
+    emotion_logits = torch.cat(all_emotion_logits, dim=0).to(device)
+    style_logits = torch.cat(all_style_logits, dim=0).to(device)
+
+    emotion_probs = torch.softmax(emotion_logits, dim=1)
+    style_probs = torch.softmax(style_logits, dim=1)
+    emotion_uncertainty = 1 - torch.max(emotion_probs, dim=1)[0]
+    style_uncertainty = 1 - torch.max(style_probs, dim=1)[0]
+    combined_uncertainty = (emotion_uncertainty + style_uncertainty) / 2
+    num_samples_to_label = 5
+    top_indices = torch.argsort(combined_uncertainty, descending=True)[:num_samples_to_label]
+    selected_texts = [unlabeled_texts[i] for i in top_indices.cpu().numpy()]
+    valid_indices = []
+    new_emotion_labels = []
+    new_style_labels = []
+   # 处理可能存在的列表类型元素，将其转换为合适的字符串
+    new_extracted_style_labels = []
+    for label in extracted_style_labels:
+        if isinstance(label, list):
+            new_extracted_style_labels.append('_'.join(map(str, label)))  # 将列表元素转换为字符串并拼接
+        elif isinstance(label, tuple):
+            new_extracted_style_labels.append('_'.join(map(str, label)))  # 将元组元素转换为字符串并拼接
+        else:
+            new_extracted_style_labels.append(str(label))  # 确保非列表和非元组元素也是字符串
+    # 假设 emotion_labels 和 style_labels 已经定义
+    emotion_labels = list(set([label[0] for label in all_labels]))
+    style_labels = list(set(new_extracted_style_labels))
+    for _ in range(3):  # 添加这个循环来控制主动学习和训练的次数
+        # 人工标注最不确定的样本
+        for iteration, original_index in enumerate(top_indices):
+            new_text = selected_texts[iteration]
+            preliminary_label = get_preliminary_emotion_label_enhance(new_text)
+            emotion_detailed_label = get_detailed_emotion_label_enhance(new_text, preliminary_label, emotion_labels)
+            style_detailed_label = get_style_label_enhance(new_text, style_labels)
+            print(f"原始输入的情感标签: {emotion_detailed_label}")
+            # 处理标签编码
+            try:
+                emotion_encoded_label = emotion_label_encoder.transform([emotion_detailed_label])[0]
+            except ValueError:
+                print(f"情感标签 '{emotion_detailed_label}' 未在编码器训练集中，更新编码器。")
+                all_emotion_classes = list(emotion_label_encoder.classes_) + [emotion_detailed_label]
+                print(f"更新前编码器的类别: {emotion_label_encoder.classes_}")
+                emotion_label_encoder = LabelEncoder()
+                emotion_label_encoder.fit(all_emotion_classes)
+                print(f"更新后编码器的类别: {emotion_label_encoder.classes_}")
+                emotion_encoded_label = emotion_label_encoder.transform([emotion_detailed_label])[0]
+            if style_detailed_label != '无':
+                try:
+                    style_encoded_label = style_label_encoder.transform([style_detailed_label])[0]
+                except ValueError:
+                    print(f"风格标签 '{style_detailed_label}' 未在编码器训练集中，更新编码器。")
+                    all_style_classes = list(style_label_encoder.classes_) + [style_detailed_label]
+                    print(f"更新前风格编码器的类别: {style_label_encoder.classes_}")
+                    style_label_encoder = MultiLabelBinarizer()
+                    style_label_encoder.fit(all_style_classes)
+                    print(f"更新后风格编码器的类别: {style_label_encoder.classes_}")
+                    style_encoded_label = style_label_encoder.transform([style_detailed_label])[0]
+            else:
+                style_encoded_label = num_classes_style - 1
+            valid_indices.append(iteration)
+            new_emotion_labels.append(emotion_detailed_label)
+            print(f"添加到 new_emotion_labels 的情感标签: {emotion_detailed_label}")
+            new_style_labels.append(style_detailed_label)
+        valid_selected_texts = [selected_texts[i] for i in valid_indices]  # 添加这一行生成 valid_selected_texts
+        # 更新训练数据
+        print(f"更新前 all_texts 长度: {len(all_texts)}")
+        all_texts.extend(valid_selected_texts)
+        print(f"更新后 all_texts 长度: {len(all_texts)}")
+        print(f"更新前 extracted_emotion_labels 长度: {len(extracted_emotion_labels)}")
+        extracted_emotion_labels.extend(new_emotion_labels)
+        print(f"更新后 extracted_emotion_labels 长度: {len(extracted_emotion_labels)}")
+        print(f"更新前 extracted_style_labels 长度: {len(extracted_style_labels)}")
+        extracted_style_labels.extend(new_style_labels)
+        print(f"更新后 extracted_style_labels 长度: {len(extracted_style_labels)}")
+        # 更新 all_labels
+        print(f"更新前 all_labels 长度: {len(all_labels)}")
+        new_all_labels = [(emotion, style) for emotion, style in zip(new_emotion_labels, new_style_labels)]
+        all_labels.extend(new_all_labels)
+        print(f"更新后 all_labels 长度: {len(all_labels)}")
+        # 重新编码标签
+        try:
+            encoded_emotion_labels = emotion_label_encoder.transform(extracted_emotion_labels)
+            print(f"编码后的情感标签的前几个值: {encoded_emotion_labels[:5]}")
+            encoded_style_labels = style_label_encoder.transform(extracted_style_labels)
+            print(f"编码后的风格标签的前几个值: {encoded_style_labels[:5]}")
+        except ValueError as e:
+            print(f"重新编码标签时出错: {e}")
+            print("当前的情感标签列表:", extracted_emotion_labels)
+            print("当前的风格标签列表:", extracted_style_labels)
+            raise
+        # 重新创建数据集和数据加载器
+        train_dataloader, val_dataloader = create_dataloaders_enhance(all_texts, all_labels, target_texts, tokenizer,
+                                                                      emotion_label_encoder, style_label_encoder)
+        model = train_enhanced_model(model, train_dataloader, val_dataloader, optimizer, emotion_criterion, style_criterion,
+                                     generation_criterion, scheduler, device, epochs=3)
+        # 保存模型
+        save_trained_model_enhance(model, optimizer)
+from sklearn.metrics.pairwise import cosine_similarity
+from scipy.spatial.distance import cosine  # 导入 cosine 函数
+# 情感标签列表
+emotion_labels = ["高兴的", "悲伤的", "愤怒的", "温和的", "紧张的", "放松的", "安心的", "害怕的", "喜爱的",
+                  "厌恶的", "中性"]
+# 风格标签列表
+style_labels = ["简约的", "话痨的", "有文化的", "无"]
+def index_to_emotion_label(index):
+    return emotion_labels[index]
+def index_to_style_label(index):
+    return style_labels[index]
+class CustomModel(nn.Module):
+    def __init__(self, chinese_bert_path, num_emotion_classes, num_style_classes):
+        super(CustomModel, self).__init__()
+        self.chinese_bert = BertModel.from_pretrained(chinese_bert_path)
+        self.emotion_classifier = nn.Sequential(
+            nn.Linear(self.chinese_bert.config.hidden_size, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(32, num_emotion_classes)
+        )
+        self.style_classifier = nn.Sequential(
+            nn.Linear(self.chinese_bert.config.hidden_size, 32),
+            nn.LayerNorm(32),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(32, num_style_classes)
+        )
+        # 添加解码器用于文本生成
+        self.decoder = nn.Linear(self.chinese_bert.config.hidden_size, self.chinese_bert.config.vocab_size)
+        # 添加 device 属性并将模型移到相应设备
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)
+    def forward(self, input_ids, attention_mask):
+        outputs = self.chinese_bert(input_ids=input_ids, attention_mask=attention_mask)
+        last_hidden_state = outputs.last_hidden_state  # 获取整个序列的隐藏状态
+        # 情感分类：使用 [CLS] 标记的隐藏状态
+        pooled_output = outputs.pooler_output
+        emotion_logits = self.emotion_classifier(pooled_output)
+        # 风格分类：使用 [CLS] 标记的隐藏状态
+        style_logits = self.style_classifier(pooled_output)
+        # 文本生成：使用整个序列的隐藏状态和 decoder 层
+        generation_logits = self.decoder(last_hidden_state)
+        return emotion_logits, style_logits, generation_logits
+    def generate(self, input_ids, attention_mask, max_length=50, num_beams=1, do_sample=False, temperature=1.0):
+        """
+        生成文本的方法
+        :param input_ids: 输入的 token ids
+        :param attention_mask: 注意力掩码
+        :param max_length: 最大生成长度
+        :param num_beams: 束搜索的束宽
+        :param do_sample: 是否使用采样策略
+        :param temperature: 采样温度
+        :return: 生成的 token ids
+        """
+        device = input_ids.device
+        input_length = input_ids.size(1)
+        generated_ids = input_ids.clone()
+        for _ in range(max_length - input_length):
+            _, _, generation_logits = self.forward(generated_ids, attention_mask)
+            next_token_logits = generation_logits[:, -1, :]  # 取最后一个时间步的 logits
+            if do_sample:
+                # 使用采样策略
+                probs = torch.softmax(next_token_logits / temperature, dim=-1)
+                next_token_id = torch.multinomial(probs, num_samples=1)
+            else:
+                # 使用束搜索或贪心搜索
+                if num_beams > 1:
+                    # 这里简单实现为贪心搜索，可根据需求扩展为束搜索
+                    next_token_id = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                else:
+                    next_token_id = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            generated_ids = torch.cat([generated_ids, next_token_id], dim=1)
+        return generated_ids
+def load_trained_model(model, optimizer, load_path, device):
+    """
+    从指定路径加载模型和优化器的状态
+    :param model: 模型实例
+    :param optimizer: 优化器实例
+    :param load_path: 加载文件的路径
+    :param device: 设备（如 'cuda' 或 'cpu'）
+    :return: 加载后的模型和优化器
+    """
+    try:
+        # 检查加载路径是否存在
+        if not os.path.exists(load_path):
+            print(f"加载路径 {load_path} 不存在，请检查路径。")
+            return model, optimizer
+        # 加载保存的检查点
+        checkpoint = torch.load(load_path, map_location=device)
+        # 处理使用 nn.DataParallel 包装的模型
+        if isinstance(model, torch.nn.DataParallel):
+            own_state = model.module.state_dict()
+        else:
+            own_state = model.state_dict()
+        for name, param in checkpoint['model_state_dict'].items():
+            if name in own_state:
+                if own_state[name].shape == param.shape:
+                    own_state[name].copy_(param)
+                else:
+                    print(f"Size mismatch for {name}: copying a param with shape {param.shape} from checkpoint, "
+                          f"the shape in current model is {own_state[name].shape}.")
+            else:
+                print(f"Unexpected key {name} in state_dict")
+
+        if isinstance(model, torch.nn.DataParallel):
+            model.module.load_state_dict(own_state)
+        else:
+            model.load_state_dict(own_state)
+        # 加载优化器的状态
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # 将模型移动到指定设备并设置为训练模式
+        model.to(device)
+        model.train()
+        print(f"模型和优化器状态已从 {load_path} 成功加载")
+        return model, optimizer
+    except Exception as e:
+        print(f"加载模型和优化器状态时出现错误: {e}")
+        return model, optimizer
+# 读取贴好标签的数据
+def process_labeled_json_files(file_paths):
+    all_texts = []
+    all_labels = []
+    for selected_file in file_paths:
+        try:
+            with open(selected_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            for item in data:
+                if 'text' in item:
+                    all_texts.append(item['text'])
+                    emotion_label = item.get('emotion_label', '待标注')
+                    style_label = item.get('style_label', ['待标注'])
+                    all_labels.append((emotion_label, style_label))
+        except json.JSONDecodeError:
+            print(f"JSON 解码错误，跳过文件: {selected_file}")
+    return all_texts, all_labels
+# 读取未贴标签的数据
+def process_unlabeled_json_files(file_paths):
+    all_texts = []
+    for selected_file in file_paths:
+        try:
+            with open(selected_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            for item in data:
+                if 'text' in item:
+                    all_texts.append(item['text'])
+        except json.JSONDecodeError:
+            print(f"JSON 解码错误，跳过文件: {selected_file}")
+    return all_texts
+# 假设 text_to_vector 函数用于将文本转换为向量
+def text_to_vector(text, tokenizer, model):
+    inputs = tokenizer(text, return_tensors='pt', truncation=True, max_length=512)  # 添加截断参数
+    input_ids = inputs['input_ids'].to(model.device)
+    attention_mask = inputs['attention_mask'].to(model.device)
+    with torch.no_grad():
+        outputs = model(input_ids, attention_mask)
+        if hasattr(outputs, 'pooler_output'):
+            return outputs.pooler_output.cpu().numpy().flatten()
+        else:
+            return outputs[0].mean(dim=1).cpu().numpy().flatten()
+
+
+# 未微调模型从贴标签文本中选择回复的函数
+def select_response_from_labeled_base(user_text, user_emotion_label, user_style_label, labeled_texts, labeled_labels,
+                                      tokenizer, model):
+    user_vector = text_to_vector(user_text, tokenizer, model)
+    matching_texts = []
+    user_emotion_labels = user_emotion_label.split(',') if ',' in user_emotion_label else [user_emotion_label]
+    for text, label in zip(labeled_texts, labeled_labels):
+        label_emotion, label_style = label
+        if any(emotion == label_emotion for emotion in user_emotion_labels) and any(
+                style in label_style for style in user_style_label):
+            text_vector = text_to_vector(text, tokenizer, model)
+            similarity = cosine_similarity([user_vector], [text_vector])[0][0]
+            matching_texts.append((text, similarity))
+    if matching_texts:
+        matching_texts.sort(key=lambda x: x[1], reverse=True)
+        return matching_texts[0][0]
+    return "未找到符合标签的回复"
+# 微调模型从贴标签文本中选择回复的函数
+def select_response_from_labeled_fine_tuned(user_text, user_emotion_label, user_style_label, labeled_texts,
+                                            labeled_labels, tokenizer, model):
+    user_vector = text_to_vector(user_text, tokenizer, model)
+    matching_texts = []
+    user_emotion_labels = user_emotion_label.split(',') if ',' in user_emotion_label else [user_emotion_label]
+    for text, label in zip(labeled_texts, labeled_labels):
+        label_emotion, label_style = label
+        inputs = tokenizer(text, return_tensors='pt', truncation=True, max_length=512)
+        input_ids = inputs['input_ids'].to(model.device)
+        attention_mask = inputs['attention_mask'].to(model.device)
+        emotion_logits, style_logits, _ = model(input_ids, attention_mask)
+        predicted_emotion = torch.argmax(emotion_logits, dim=1).item()
+        predicted_style = torch.argmax(style_logits, dim=1).item()
+        predicted_emotion_label = index_to_emotion_label(predicted_emotion)
+        predicted_style_label = index_to_style_label(predicted_style)
+        emotion_matched = any(
+            [emotion in user_emotion_labels for emotion in [predicted_emotion_label, label_emotion]])
+        if (emotion_matched and predicted_style_label in user_style_label) or \
+                (any(emotion == label_emotion for emotion in user_emotion_labels) and any(
+                    style in label_style for style in user_style_label)):
+            text_vector = text_to_vector(text, tokenizer, model)
+            similarity = cosine_similarity([user_vector], [text_vector])[0][0]
+            matching_texts.append((text, similarity))
+    if matching_texts:
+        matching_texts.sort(key=lambda x: x[1], reverse=True)
+        return matching_texts[0][0]
+    return "未找到符合标签的回复"
+# 未微调模型从未贴标签文本中选择回复的函数
+def select_response_from_unlabeled_base(user_text, user_emotion_label, user_style_label, unlabeled_texts, tokenizer,
+                                        model):
+    user_vector = text_to_vector(user_text, tokenizer, model)
+    similarities = []
+    user_emotion_labels = user_emotion_label.split(',') if ',' in user_emotion_label else [user_emotion_label]
+    for text in unlabeled_texts:
+        text_vector = text_to_vector(text, tokenizer, model)
+        similarity = 1 - cosine(user_vector, text_vector)
+        # 若有实际预测逻辑，可参考微调模型部分添加
+        similarities.append(similarity)
+    if similarities:
+        best_index = np.argmax(similarities)
+        return unlabeled_texts[best_index]
+    return "未找到合适的回复"
+# 微调模型从未贴标签文本中选择回复的函数
+def select_response_from_unlabeled_fine_tuned(user_text, user_emotion_label, user_style_label, unlabeled_texts,
+                                              tokenizer, model):
+    user_vector = text_to_vector(user_text, tokenizer, model)
+    matching_texts = []
+    user_emotion_labels = user_emotion_label.split(',') if ',' in user_emotion_label else [user_emotion_label]
+    for text in unlabeled_texts:
+        inputs = tokenizer(text, return_tensors='pt', truncation=True, max_length=512)
+        input_ids = inputs['input_ids'].to(model.device)
+        attention_mask = inputs['attention_mask'].to(model.device)
+        emotion_logits, style_logits, _ = model(input_ids, attention_mask)
+        predicted_emotion = torch.argmax(emotion_logits, dim=1).item()
+        predicted_style = torch.argmax(style_logits, dim=1).item()
+        predicted_emotion_label = index_to_emotion_label(predicted_emotion)
+        predicted_style_label = index_to_style_label(predicted_style)
+
+        emotion_matched = predicted_emotion_label in user_emotion_labels
+
+        if emotion_matched and predicted_style_label in user_style_label:
+            text_vector = text_to_vector(text, tokenizer, model)
+            similarity = cosine_similarity([user_vector], [text_vector])[0][0]
+            matching_texts.append((text, similarity))
+    if matching_texts:
+        matching_texts.sort(key=lambda x: x[1], reverse=True)
+        return matching_texts[0][0]
+    return "未找到合适的回复"
+def load_partial_state_dict(model, state_dict):
+    own_state = model.state_dict()
+    for name, param in state_dict.items():
+        if name in own_state:
+            if own_state[name].shape == param.shape:
+                own_state[name].copy_(param)
+            else:
+                print(f"Size mismatch for {name}: copying a param with shape {param.shape} from checkpoint, "
+                      f"the shape in current model is {own_state[name].shape}.")
+        else:
+            print(f"Unexpected key {name} in state_dict")
+    model.load_state_dict(own_state)
+return model
+if __name__ == "__main__":
+    labeled_file_paths = ['/kaggle/working/inputs_copy/58-7mb/labeled_data_20250215-212709.json',
+                          '/kaggle/working/inputs_copy/traditionalculture/traditional_culture.json']
+    unlabeled_file_paths = ['/kaggle/working/inputs_copy/unlabeled/labeled_data_20250213-195050.json']
+  
+    labeled_texts, labeled_labels = process_labeled_json_files(labeled_file_paths)
+    unlabeled_texts = process_unlabeled_json_files(unlabeled_file_paths)
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+    # 加载未微调的 BERT 模型
+    base_model = BertModel.from_pretrained('bert-base-uncased')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    base_model.to(device)
+    # 加载微调后的自定义模型
+    num_emotion_classes = len(emotion_labels)
+    num_style_classes = len(style_labels)
+    fine_tuned_custom_model = CustomModel('bert-base-uncased', num_emotion_classes, num_style_classes)
+    optimizer = torch.optim.Adam(fine_tuned_custom_model.parameters(), lr=1e-5)
+    saved_model_path = '/kaggle/working/inputs_copy/20250323/pytorch/default/1/model_20250323-080227.pth'  # 根据实际保存的路径修改
+    # 假设这里有 load_trained_model 函数
+    fine_tuned_custom_model, optimizer = load_trained_model(fine_tuned_custom_model, optimizer, saved_model_path, device)
+    fine_tuned_custom_model.to(device)
+    fine_tuned_custom_model.eval()
+    while True:
+        user_text = input("请输入一个文本（输入 'quit' 退出测试）：")
+        if user_text.lower() == 'quit':
+            break
+        user_emotion_label = input("情感标签：")
+        user_style_label = input("风格标签：")
+        user_style_label = user_style_label.split(',') if ',' in user_style_label else [user_style_label]
+        # 使用未微调的模型选择回复
+        response_from_labeled_base = select_response_from_labeled_base(user_text, user_emotion_label, user_style_label,
+                                                                       labeled_texts, labeled_labels, tokenizer, base_model)
+        response_from_unlabeled_base = select_response_from_unlabeled_base(user_text,user_emotion_label, user_style_label,
+                                                                           unlabeled_texts, tokenizer, base_model)
+        # 使用微调后的模型选择回复
+        response_from_labeled_fine_tuned = select_response_from_labeled_fine_tuned(user_text, user_emotion_label,
+                                                                                   user_style_label,
+                                                                                   labeled_texts, labeled_labels, tokenizer,
+                                                                                   fine_tuned_custom_model)
+        response_from_unlabeled_fine_tuned = select_response_from_unlabeled_fine_tuned(user_text, user_emotion_label,
+                                                                                       user_style_label,
+                                                                                       unlabeled_texts, tokenizer,
+                                                                                       fine_tuned_custom_model)
+
+        print(f"使用未微调模型，从贴好标签的文本中选择的回复：{response_from_labeled_base}")
+        print(f"使用未微调模型，从未贴标签的文本中选择的回复：{response_from_unlabeled_base}")
+        print(f"使用微调后模型，从贴好标签的文本中选择的回复：{response_from_labeled_fine_tuned}")
+        print(f"使用微调后模型，从未贴标签的文本中选择的回复：{response_from_unlabeled_fine_tuned}")
